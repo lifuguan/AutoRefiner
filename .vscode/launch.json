@@ -1,0 +1,51 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Auto Mask Align SAV",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/auto-mask-align-sav.py",
+            "args": [
+                "--image_dir", "/mnt/juicefs/datasets/cut3r_processed/processed_dl3dv_ours_parts/processed_dl3dv_ours/1K/001dccbc1f78146a9f03861026613d8e73f39f372b545b26118e37a23c740d5f/dense/rgb",
+                "--output_dir", "tmp_output",
+                "--level", "large"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
+        },
+        {
+            "name": "Run AutoMaskService with SAM2 Checkpoint",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/auto_mask_service.py",
+            "args": [
+                "run",
+                "auto_mask_service.py:AutoMaskService",
+                "--custom_args",
+                "{\"sam2_checkpoint\":\"/data/model_zoo/sam/sam2_hiera_large.pt\"}"
+            ],
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: auto-mask-batch",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/auto-mask-batch.py",
+            "args": [
+                "--video_path",
+                "/data/SamVGGT/datasets/processed_scannetpp_eval/0cf2e9402d/images",
+                "--output_dir",
+                "/data/SamVGGT/datasets/processed_scannetpp_eval/0cf2e9402d/sam2"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+
+    ]
+}

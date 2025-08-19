@@ -1,0 +1,6 @@
+*.pth
+*.pt
+videos/*
+output/
+__pycache__
+sam2_results
