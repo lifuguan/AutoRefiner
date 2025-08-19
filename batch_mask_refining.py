@@ -16,7 +16,70 @@ import argparse
 import time
 import logging
 import contextlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from mask_refiner_matching import SAM2MaskMatcher
+
+
+class MultiProgressManager:
+    """多进度条管理器"""
+
+    def __init__(self):
+        self.progress_bars = {}
+        self.lock = threading.Lock()
+        self.main_pbar = None
+
+    def create_main_progress(self, total_scenes, desc="处理场景"):
+        """创建主进度条"""
+        self.main_pbar = tqdm(total=total_scenes, desc=desc, position=0, leave=True)
+        return self.main_pbar
+
+    def create_process_progress(self, process_id, total_scenes, desc=None):
+        """为每个进程创建进度条"""
+        if desc is None:
+            desc = f"进程 {process_id}"
+
+        with self.lock:
+            pbar = tqdm(
+                total=total_scenes,
+                desc=desc,
+                position=process_id + 1,
+                leave=True,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
+            self.progress_bars[process_id] = pbar
+            return pbar
+
+    def update_process_progress(self, process_id, n=1):
+        """更新进程进度条"""
+        with self.lock:
+            if process_id in self.progress_bars:
+                self.progress_bars[process_id].update(n)
+
+    def update_main_progress(self, n=1):
+        """更新主进度条"""
+        if self.main_pbar:
+            self.main_pbar.update(n)
+
+    def close_process_progress(self, process_id):
+        """关闭进程进度条"""
+        with self.lock:
+            if process_id in self.progress_bars:
+                self.progress_bars[process_id].close()
+                del self.progress_bars[process_id]
+
+    def close_all(self):
+        """关闭所有进度条"""
+        with self.lock:
+            for pbar in self.progress_bars.values():
+                pbar.close()
+            self.progress_bars.clear()
+            if self.main_pbar:
+                self.main_pbar.close()
+
+
+# 全局进度管理器
+progress_manager = MultiProgressManager()
 
 
 def setup_logging():
@@ -234,8 +297,8 @@ def process_scene_sequential(scene_path, model_cfg, checkpoint, gpu_id):
     return scene_result
 
 
-def process_scenes_on_gpu(scene_list, model_cfg, checkpoint, gpu_id):
-    """在指定GPU上处理多个场景"""
+def process_single_scene_list(scene_list, model_cfg, checkpoint, gpu_id, process_id):
+    """在指定GPU上的单个进程处理多个场景"""
 
     # 在子进程中重新设置环境
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -247,28 +310,54 @@ def process_scenes_on_gpu(scene_list, model_cfg, checkpoint, gpu_id):
 
     # 在子进程中重新设置日志
     logger = setup_logging()
-    logger.info(f"GPU {gpu_id} 开始处理 {len(scene_list)} 个场景")
+    logger.info(f"进程 {process_id} (GPU {gpu_id}) 开始处理 {len(scene_list)} 个场景")
 
     # 验证CUDA设置
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        logger.info(f"GPU {gpu_id} CUDA可用，设备数量: {torch.cuda.device_count()}")
+        logger.info(f"进程 {process_id} (GPU {gpu_id}) CUDA可用，设备数量: {torch.cuda.device_count()}")
     else:
-        logger.warning(f"GPU {gpu_id} CUDA不可用，将使用CPU")
+        logger.warning(f"进程 {process_id} (GPU {gpu_id}) CUDA不可用，将使用CPU")
 
     results = []
-    for scene_path in scene_list:
-        result = process_scene_sequential(scene_path, model_cfg, checkpoint, gpu_id)
-        results.append(result)
 
-        # 记录每个场景的完成情况
-        if result['status'] == 'completed':
-            logger.info(f"GPU {gpu_id} 完成场景 {result['scene']}: {result['successful']}/{result['total_images']} 成功")
-        else:
-            logger.warning(f"GPU {gpu_id} 场景 {result['scene']} 处理失败: {result['status']}")
+    # 创建进程专用的进度条
+    pbar = tqdm(
+        total=len(scene_list),
+        desc=f"GPU{gpu_id}-P{process_id}",
+        position=process_id + 1,
+        leave=True,
+        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+        ncols=100
+    )
 
-    logger.info(f"GPU {gpu_id} 完成所有场景处理")
+    try:
+        for i, scene_path in enumerate(scene_list):
+            scene_name = os.path.basename(scene_path)
+            pbar.set_description(f"GPU{gpu_id}-P{process_id}: {scene_name}")
+
+            result = process_scene_sequential(scene_path, model_cfg, checkpoint, gpu_id)
+            results.append(result)
+
+            # 更新进度条
+            pbar.update(1)
+
+            # 记录每个场景的完成情况
+            if result['status'] == 'completed':
+                logger.info(f"进程 {process_id} (GPU {gpu_id}) 完成场景 {result['scene']}: {result['successful']}/{result['total_images']} 成功")
+            else:
+                logger.warning(f"进程 {process_id} (GPU {gpu_id}) 场景 {result['scene']} 处理失败: {result['status']}")
+
+    finally:
+        pbar.close()
+
+    logger.info(f"进程 {process_id} (GPU {gpu_id}) 完成所有场景处理")
     return results
+
+
+def process_scenes_on_gpu(scene_list, model_cfg, checkpoint, gpu_id):
+    """在指定GPU上处理多个场景（保留向后兼容性）"""
+    return process_single_scene_list(scene_list, model_cfg, checkpoint, gpu_id, gpu_id)
 
 
 def main():
@@ -283,6 +372,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="model_zoo/sam/sam2_hiera_large.pt", help="SAM2模型权重文件")
     parser.add_argument("--max_scenes", type=int, default=None, help="最大处理场景数（用于测试）")
     parser.add_argument("--sequential", action="store_true", help="顺序处理（避免多进程问题）")
+    parser.add_argument("--processes_per_gpu", type=int, default=2, help="每个GPU上的进程数（默认2）")
 
     args = parser.parse_args()
 
@@ -336,30 +426,42 @@ def main():
     all_results = []
 
     if not args.sequential:
-        # 多GPU并行处理（强制使用多进程）
-        logger.info(f"使用 {num_gpus} 个GPU并行处理")
+        # 多GPU多进程并行处理
+        total_processes = num_gpus * args.processes_per_gpu
+        logger.info(f"使用 {num_gpus} 个GPU，每个GPU {args.processes_per_gpu} 个进程，总共 {total_processes} 个进程")
 
-        # 将场景分组，每个GPU处理一组
-        scene_groups = [[] for _ in range(num_gpus)]
+        # 将场景分配给所有进程
+        scene_groups = [[] for _ in range(total_processes)]
         for i, scene_path in enumerate(scene_list):
-            scene_groups[i % num_gpus].append(scene_path)
+            scene_groups[i % total_processes].append(scene_path)
 
         logger.info(f"场景分组: {[len(group) for group in scene_groups]}")
 
         # 创建进程池
-        with mp.Pool(processes=num_gpus) as pool:
-            # 为每个GPU创建一个任务
+        with mp.Pool(processes=total_processes) as pool:
+            # 为每个进程创建一个任务
             tasks = []
-            for gpu_id in range(num_gpus):
-                if scene_groups[gpu_id]:  # 如果该GPU有场景要处理
+            for process_id in range(total_processes):
+                if scene_groups[process_id]:  # 如果该进程有场景要处理
+                    gpu_id = process_id // args.processes_per_gpu  # 计算该进程应该使用的GPU ID
                     task = pool.apply_async(
-                        process_scenes_on_gpu,
-                        (scene_groups[gpu_id], args.model_cfg, checkpoint, gpu_id)
+                        process_single_scene_list,
+                        (scene_groups[process_id], args.model_cfg, checkpoint, gpu_id, process_id)
                     )
                     tasks.append(task)
 
-            # 等待所有任务完成并收集结果
-            with tqdm(total=len(scene_list), desc="处理场景") as pbar:
+            # 创建主进度条
+            main_pbar = tqdm(
+                total=len(scene_list),
+                desc="总体进度",
+                position=0,
+                leave=True,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {desc}',
+                ncols=100
+            )
+
+            try:
+                # 等待所有任务完成并收集结果
                 completed_scenes = 0
                 while completed_scenes < len(scene_list):
                     for task in tasks:
@@ -368,7 +470,7 @@ def main():
                                 gpu_results = task.get()
                                 all_results.extend(gpu_results)
                                 completed_scenes += len(gpu_results)
-                                pbar.update(len(gpu_results))
+                                main_pbar.update(len(gpu_results))
                                 tasks.remove(task)
                                 break
                             except Exception as e:
@@ -376,6 +478,8 @@ def main():
                                 tasks.remove(task)
                                 break
                     time.sleep(0.1)  # 短暂等待
+            finally:
+                main_pbar.close()
     else:
         # 单GPU或CPU顺序处理
         logger.info("使用单GPU/CPU顺序处理")
